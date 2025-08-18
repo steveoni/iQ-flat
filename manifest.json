@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "iQ♭",
+  "version": "1.0",
+  "description": "Help prioritize text using AI. It also provide summary and supporting text for each prioritized item.",
+  "permissions": ["activeTab", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self';"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["scripts/content.js"],
+      "world": "ISOLATED",
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["scripts/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

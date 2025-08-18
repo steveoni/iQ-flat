@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>OCR + LLM Quiz Solver</title>
+    <style>
+      body {
+        width: 400px;
+        padding: 10px;
+        font-family: Arial, sans-serif;
+      }
+      input,
+      button {
+        margin: 5px 0;
+        width: 100%;
+        box-sizing: border-box;
+        padding: 5px;
+      }
+      #result {
+        white-space: pre-wrap;
+        background-color: #f5f5f5;
+        padding: 10px;
+        max-height: 300px;
+        overflow-y: auto;
+        border: 1px solid #ccc;
+        margin-top: 10px;
+      }
+      #status {
+        margin-top: 10px;
+        font-style: italic;
+      }
+    </style>
+  </head>
+  <body>
+    <h2>iQ♭ Settings</h2>
+
+    <label for="apiEndpoint">API Endpoint:</label>
+    <input
+      type="text"
+      id="apiEndpoint"
+      placeholder="https://api.example.com/v1/chat"
+    />
+
+    <label for="apiKey">API Key:</label>
+    <input type="password" id="apiKey" placeholder="Your API key" />
+
+    <div>
+      <button id="saveBtn">Save Credentials</button>
+    </div>
+
+    <div id="status"></div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
