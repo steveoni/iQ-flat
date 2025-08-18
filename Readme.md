@@ -1,12 +1,14 @@
 ## iQ♭
 
-There is something about summarizing text (sentence or page); even though it gives insight into what the text is about, it looses the spatial representation of the text. In remembering things or deducting the general overview of a text (sentence or phrase), the surrounding text and flow of deduction matters.
+Summaries often lose the spatial structure and logical flow that help us remember and understand a text. iQ♭ preserves that structure: it ranks sentences and phrases by importance, links each main idea to the supporting passages that explain it, and highlights them by priority with concise summaries attached.
 
-This app, provide a means to see the flow of deduction, maintain the spatial representation of texts while presenting the summary and the level of priority. How it does that:
+How it works:
 
-1. identify phrases, sentence and then rank them based on level of importance
-2. Identify the most importent text and it supporting text that expresses the fully intent of the most important text
-3. Higlight these texts based on their priority color and also attached their summary.
+1. Detects and ranks phrases and sentences by importance.
+
+2. Links each top idea to the supporting passages that fully convey its intent.
+
+3. Highlights passages by priority color and attaches short summaries for quick review.
 
 ![img](./image/prioritize.png)
 
