@@ -595,8 +595,9 @@ function highlightTextNode(match, item, color, modifiedNodes) {
 function cleanLLMResponse(response) {
   try {
     try {
-      JSON.parse(response);
-      return response;
+      let c = JSON.parse(response);
+
+      return c["highlights"] ? JSON.stringify(c["highlights"]) : "[]";
     } catch (e) {}
 
     let cleaned = response;
