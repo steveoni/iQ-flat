@@ -1,10 +1,13 @@
-// Constants for UI and chunking
+// Constants for UI and processing
 const CONSTANTS = {
   buttonID: "prioritize-text-button",
   outputElementID: "prioritize-output-container",
   shadowRootID: "prioritize-shadow-root",
-  MAX_CHUNK_SIZE: 25000,
-  DEBUG_MAX_CHUNKS: null,
+  MAX_TOKENS: 25000,
+  SYSTEM_PROMPT_TOKENS: 1000,
+  RESPONSE_TOKENS: 2000,
+  OVERLAP_TOKENS: 300,
+  DEBUG_MODE: false,
 };
 
 // Create Shadow DOM to avoid CSS conflicts
@@ -61,401 +64,790 @@ function createUI() {
   shadowRoot.appendChild(button);
   shadowRoot.appendChild(outputElement);
 
-  button.addEventListener("click", captureAndProcess);
+  button.addEventListener("click", processPage);
 }
 
-// Extracts text nodes from the page and chunks them
-function captureAndProcess() {
-  const textNodes = [];
-
-  function extractTextNodes(node) {
-    if (node.nodeType === Node.TEXT_NODE) {
-      const text = node.textContent.trim();
-      if (text.length > 0) {
-        textNodes.push({
-          node: node,
-          text: text,
-          parentElement: node.parentElement,
-        });
-      }
-    } else if (node.nodeType === Node.ELEMENT_NODE) {
-      if (
-        node.tagName === "CODE" ||
-        node.tagName === "PRE" ||
-        (node.className &&
-          typeof node.className === "string" &&
-          (node.className.includes("hljs") || node.className.includes("code")))
-      ) {
-        const codeText = node.textContent.trim();
-        if (codeText.length > 0) {
-          textNodes.push({
-            node: node,
-            text: codeText,
-            parentElement: node.parentElement,
-            isCodeBlock: true,
-            originalHTML: node.innerHTML,
-          });
-        }
-        return;
-      }
-      if (
-        node !== shadowHost &&
-        getComputedStyle(node).display !== "none" &&
-        getComputedStyle(node).visibility !== "hidden"
-      ) {
-        for (let i = 0; i < node.childNodes.length; i++) {
-          extractTextNodes(node.childNodes[i]);
-        }
-      }
-    }
-  }
-
-  extractTextNodes(document.body);
-
-  const chunks = [];
-  let currentChunk = [];
-  let currentChunkSize = 0;
-
-  for (let i = 0; i < textNodes.length; i++) {
-    const node = textNodes[i];
-    if (
-      currentChunkSize + node.text.length > CONSTANTS.MAX_CHUNK_SIZE &&
-      currentChunk.length > 0
-    ) {
-      chunks.push({
-        textNodes: currentChunk,
-        text: currentChunk.map((item) => item.text).join("\n"),
-      });
-      currentChunk = [];
-      currentChunkSize = 0;
-    }
-    currentChunk.push(node);
-    currentChunkSize += node.text.length;
-  }
-
-  if (currentChunk.length > 0) {
-    chunks.push({
-      textNodes: currentChunk,
-      text: currentChunk.map((item) => item.text).join("\n"),
-    });
-  }
-
-  console.log(`Created ${chunks.length} chunks`);
-  processAllChunks(chunks, textNodes);
-}
-
-// Processes the entire page text (not chunked)
-async function processText(pageText, textNodes) {
+/**
+ * Main function to process the page content
+ */
+async function processPage() {
   const outputElement = shadowRoot.getElementById(CONSTANTS.outputElementID);
   outputElement.style.display = "block";
   outputElement.innerHTML =
-    '<div style="padding:10px;text-align:center">Processing...</div>';
+    '<div style="padding:10px;text-align:center">Analyzing page structure...</div>';
 
   try {
-    const aiResponse = await sendToGemini(pageText);
-    const cleanedResponse = cleanLLMResponse(aiResponse);
-    const prioritizedText = JSON.parse(cleanedResponse);
-    applyTextHighlighting(prioritizedText, textNodes);
+    // 1. Extract semantic elements from the page
+    const semanticElements = extractSemanticElements(document.body);
+    console.log("Smeantic Elements:", semanticElements);
 
-    outputElement.innerHTML = `
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <div>Text Prioritization Complete</div>
-        <button style="background:transparent;border:none;color:#aaa;cursor:pointer;font-size:18px">×</button>
-      </div>
-      <div style="background:#252525;padding:12px;border-radius:6px;font-size:13px">
-        <p>Highlighted text by priority:</p>
-        <div style="display:flex;gap:10px;margin-bottom:8px">
-          <span style="background:green;color:white;padding:2px 8px;border-radius:4px">High priority</span>
-          <span style="background:yellow;color:black;padding:2px 8px;border-radius:4px">Supporting</span>
-          <span style="background:red;color:white;padding:2px 8px;border-radius:4px">Important standalone</span>
-        </div>
-        <button id="reset-highlights" style="margin-top:12px;padding:8px;width:100%;background:#404040;border:none;border-radius:4px;color:white;cursor:pointer">
-          Reset Highlights
-        </button>
-      </div>
-    `;
+    // 2. Create semantic chunks from the elements
+    outputElement.innerHTML =
+      '<div style="padding:10px;text-align:center">Creating semantic chunks...</div>';
+    const chunks = await createSemanticChunks(semanticElements);
+    console.log(`Created ${chunks.length} semantic chunks`);
+    console.log("Chunks:", chunks);
 
-    outputElement
-      .querySelector("button#reset-highlights")
-      .addEventListener("click", () => {
-        resetHighlights();
-      });
-
-    outputElement
-      .querySelector('button[style*="background:transparent"]')
-      .addEventListener("click", () => {
-        outputElement.style.display = "none";
-      });
+    // 3. Process chunks with LLM
+    await processChunks(chunks);
   } catch (error) {
+    console.error("Error processing page:", error);
     outputElement.innerHTML = `<div style="color:#ff6b6b;padding:10px">Error: ${error.message}</div>`;
   }
 }
+
 /**
- * Processes all text chunks, sends them to the LLM, handles incomplete responses,
- * combines results, and applies highlighting to the DOM.
+ * Extracts semantic elements from the DOM with their metadata
+ * @param {Node} rootNode - The root node to start extraction from
+ * @returns {Array} Array of semantic elements with metadata
  */
-async function processAllChunks(chunks, allTextNodes) {
-  const outputElement = shadowRoot.getElementById(CONSTANTS.outputElementID);
-  outputElement.style.display = "block";
-  const processChunks = CONSTANTS.DEBUG_MAX_CHUNKS
-    ? chunks.slice(0, CONSTANTS.DEBUG_MAX_CHUNKS)
-    : chunks;
-  outputElement.innerHTML =
-    '<div style="padding:10px;text-align:center">Processing text in ' +
-    processChunks.length +
-    " chunks..." +
-    (CONSTANTS.DEBUG_MAX_CHUNKS
-      ? ` (Debug mode: limited to ${CONSTANTS.DEBUG_MAX_CHUNKS} chunks)`
-      : "") +
-    "</div>";
+function extractSemanticElements(rootNode) {
+  const semanticElements = [];
+  const seenContent = new Set(); // Track text content we've already processed
+
+  // Skip these elements entirely
+  const TAGS_TO_SKIP = [
+    "script",
+    "style",
+    "noscript",
+    "iframe",
+    "object",
+    "embed",
+    "svg",
+    "math",
+    "template",
+    "link",
+    "meta",
+    "head",
+    "nav",
+  ];
+
+  // Skip elements with these classes or IDs (common UI patterns)
+  const CLASS_ID_PATTERNS_TO_SKIP = [
+    "nav",
+    "menu",
+    "sidebar",
+    "footer",
+    "header",
+    "theme",
+    "toolbar",
+    "button",
+    "toggle",
+    "dropdown",
+    "modal",
+  ];
+
+  function shouldSkipElement(element) {
+    // Skip by tag
+    if (TAGS_TO_SKIP.includes(element.tagName.toLowerCase())) {
+      return true;
+    }
+
+    // Skip invisible elements
+    const style = window.getComputedStyle(element);
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      element === shadowHost
+    ) {
+      return true;
+    }
+
+    // Skip by class/id patterns
+    if (element.className && typeof element.className === "string") {
+      for (const pattern of CLASS_ID_PATTERNS_TO_SKIP) {
+        if (element.className.toLowerCase().includes(pattern)) {
+          return true;
+        }
+      }
+    }
+
+    if (element.id) {
+      for (const pattern of CLASS_ID_PATTERNS_TO_SKIP) {
+        if (element.id.toLowerCase().includes(pattern)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  // Process an element to extract meaningful content
+  function processElement(element, depth = 0) {
+    if (shouldSkipElement(element)) {
+      return;
+    }
+
+    const tag = element.tagName.toLowerCase();
+
+    // Identify standalone code blocks vs inline code
+    const isStandaloneCodeBlock =
+      tag === "pre" ||
+      (tag === "code" &&
+        element.parentElement?.tagName.toLowerCase() === "pre") ||
+      (element.className &&
+        typeof element.className === "string" &&
+        (element.className.includes("hljs") ||
+          element.className.includes("code-block") ||
+          element.className.includes("language-")));
+
+    // Handle standalone code blocks
+    if (isStandaloneCodeBlock) {
+      const text = element.textContent.trim();
+      if (text) {
+        semanticElements.push({
+          type: "code",
+          element: element,
+          tag: tag,
+          text: text,
+          depth: depth,
+          isCodeBlock: true,
+          isStandalone: true,
+        });
+      }
+      return; // Don't process children of code blocks
+    }
+
+    // For normal elements, collect text INCLUDING inline code elements
+    let combinedText = "";
+
+    // Process all child nodes to handle inline code properly
+    for (const childNode of element.childNodes) {
+      // Text nodes - add directly
+      if (childNode.nodeType === Node.TEXT_NODE) {
+        const trimmed = childNode.textContent.trim();
+        if (trimmed) {
+          combinedText += trimmed + " ";
+        }
+      }
+      // Inline code elements - wrap with backticks
+      else if (
+        childNode.nodeType === Node.ELEMENT_NODE &&
+        childNode.tagName.toLowerCase() === "code"
+      ) {
+        const codeText = childNode.textContent.trim();
+        if (codeText) {
+          combinedText += "`" + codeText + "` ";
+        }
+      }
+    }
+
+    combinedText = combinedText.trim();
+
+    if (combinedText) {
+      if (!seenContent.has(combinedText)) {
+        seenContent.add(combinedText);
+
+        semanticElements.push({
+          type: "text",
+          element: element,
+          tag: tag,
+          text: combinedText,
+          depth: depth,
+          containsInlineCode: combinedText.includes("`"),
+        });
+      }
+    }
+
+    // For headings and semantic block elements, add regardless of direct text
+    if (
+      /^h[1-6]$/.test(tag) ||
+      ["p", "li", "blockquote", "table", "tr"].includes(tag)
+    ) {
+      let fullText = "";
+      let hasInlineCode = false;
+
+      // Collect all text including properly formatted inline code
+      function collectTextWithInlineCode(node) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          const trimmed = node.textContent.trim();
+          if (trimmed) {
+            fullText += trimmed + " ";
+          }
+        } else if (node.nodeType === Node.ELEMENT_NODE) {
+          const childTag = node.tagName.toLowerCase();
+
+          // Handle inline code
+          if (
+            childTag === "code" &&
+            node.parentElement !== element.parentElement
+          ) {
+            const codeText = node.textContent.trim();
+            if (codeText) {
+              fullText += "`" + codeText + "` ";
+              hasInlineCode = true;
+            }
+            return;
+          }
+
+          if (
+            ["div", "p", "blockquote", "section", "article"].includes(childTag)
+          ) {
+            return;
+          }
+
+          // Process children recursively
+          for (const child of node.childNodes) {
+            collectTextWithInlineCode(child);
+          }
+        }
+      }
+
+      collectTextWithInlineCode(element);
+      fullText = fullText.trim();
+
+      if (fullText && fullText !== combinedText) {
+        // Skip if we've seen this text before
+        if (!seenContent.has(fullText)) {
+          seenContent.add(fullText);
+
+          semanticElements.push({
+            type: "block",
+            element: element,
+            tag: tag,
+            text: fullText,
+            depth: depth,
+            containsInlineCode: hasInlineCode,
+          });
+        }
+      }
+    }
+
+    for (let i = 0; i < element.children.length; i++) {
+      const child = element.children[i];
+      if (!(child.tagName.toLowerCase() === "code" && !isStandaloneCodeBlock)) {
+        processElement(child, depth + 1);
+      }
+    }
+  }
+
+  processElement(rootNode);
+
+  return semanticElements;
+}
+/**
+ * Creates semantic chunks from the extracted elements
+ * @param {Array} elements - Array of semantic elements
+ * @returns {Array} Array of chunks ready for processing
+ */
+async function createSemanticChunks(elements) {
+  const systemPromptResponse = await chrome.runtime.sendMessage({
+    action: "countTokens",
+    includeSystemPrompt: true,
+    text: "",
+  });
+
+  const systemPromptTokens = systemPromptResponse.success
+    ? systemPromptResponse.tokenCount
+    : CONSTANTS.SYSTEM_PROMPT_TOKENS;
+
+  console.log(`System prompt uses ${systemPromptTokens} tokens`);
+
+  // Available tokens for content
+  const AVAILABLE_TOKENS =
+    CONSTANTS.MAX_TOKENS - systemPromptTokens - CONSTANTS.RESPONSE_TOKENS;
+
+  const chunks = [];
+  let currentChunk = {
+    elements: [],
+    text: "",
+    elementTypes: {},
+    headings: [],
+    estimatedTokens: 0,
+  };
+
+  // Process each semantic element
+  for (let i = 0; i < elements.length; i++) {
+    const element = elements[i];
+
+    const elementTokens = Math.ceil(element.text.length / 4);
+
+    // Check if this is a heading to track for context
+    if (/^h[1-6]$/.test(element.tag)) {
+      // Add heading to tracking regardless of chunk boundaries
+      const headingLevel = parseInt(element.tag.substring(1));
+
+      // If we already have headings, only add if it's equal or higher level
+      if (
+        currentChunk.headings.length === 0 ||
+        headingLevel <=
+          currentChunk.headings[currentChunk.headings.length - 1].level
+      ) {
+        currentChunk.headings.push({
+          level: headingLevel,
+          text: element.text,
+          tag: element.tag,
+        });
+      }
+    }
+
+    // Handle large elements that exceed chunk size
+    if (elementTokens > AVAILABLE_TOKENS * 0.8) {
+      console.log(`Large element found (${elementTokens} tokens), splitting`);
+
+      // If we have accumulated content, finalize current chunk
+      if (currentChunk.elements.length > 0) {
+        const chunk = finalizeChunk(currentChunk);
+        chunks.push(chunk);
+
+        // Create new chunk with context from previous
+        currentChunk = createNewChunkWithContext(currentChunk);
+      }
+
+      // Split large element into sub-chunks
+      const subChunks = splitLargeElement(element, AVAILABLE_TOKENS * 0.8);
+
+      for (const subChunk of subChunks) {
+        const subChunkTokens = Math.ceil(subChunk.text.length / 4);
+
+        const subElement = {
+          ...element,
+          text: subChunk.text,
+          isSplit: true,
+          splitIndex: subChunk.index,
+          totalSplits: subChunks.length,
+        };
+
+        const subChunkWrapper = {
+          elements: [subElement],
+          text: addChunkMetadata(
+            subElement.text,
+            [subElement],
+            currentChunk.headings
+          ),
+          elementTypes: { [element.type]: 1 },
+          headings: [...currentChunk.headings],
+          estimatedTokens: subChunkTokens,
+        };
+
+        chunks.push(finalizeChunk(subChunkWrapper));
+
+        // Update context for next chunk
+        currentChunk = createNewChunkWithContext(subChunkWrapper);
+      }
+
+      continue;
+    }
+
+    // Check if adding this element would exceed the token limit
+    const newTokenEstimate = currentChunk.estimatedTokens + elementTokens;
+
+    if (
+      newTokenEstimate > AVAILABLE_TOKENS * 0.8 &&
+      currentChunk.elements.length > 0
+    ) {
+      // Finalize current chunk
+      chunks.push(finalizeChunk(currentChunk));
+
+      // Create new chunk with context from previous
+      currentChunk = createNewChunkWithContext(currentChunk);
+    }
+
+    currentChunk.elements.push(element);
+
+    if (!currentChunk.elementTypes[element.type]) {
+      currentChunk.elementTypes[element.type] = 0;
+    }
+    currentChunk.elementTypes[element.type]++;
+
+    if (currentChunk.text) {
+      currentChunk.text += "\n\n";
+    }
+
+    const elementWithMetadata = `[${element.type}:${element.tag}] ${element.text}`;
+    currentChunk.text += elementWithMetadata;
+    currentChunk.estimatedTokens += elementTokens;
+  }
+
+  // Add the final chunk if not empty
+  if (currentChunk.elements.length > 0) {
+    chunks.push(finalizeChunk(currentChunk));
+  }
+  const chunksr = await Promise.all(chunks);
+  return chunksr;
+}
+
+/**
+ * Adds semantic metadata to chunk text
+ */
+function addChunkMetadata(text, elements, headings) {
+  const metadata = [];
+
+  if (headings && headings.length > 0) {
+    metadata.push("# Document Structure Context");
+    headings.forEach((heading) => {
+      const indent = "  ".repeat(heading.level - 1);
+      metadata.push(`${indent}${heading.tag}: ${heading.text}`);
+    });
+  }
+
+  // Add element type summary
+  const elementTypes = {};
+  elements.forEach((el) => {
+    if (!elementTypes[el.type]) elementTypes[el.type] = 0;
+    elementTypes[el.type]++;
+  });
+
+  const typeSummary = Object.entries(elementTypes)
+    .map(([type, count]) => `${type}: ${count}`)
+    .join(", ");
+
+  metadata.push(
+    `\n# Semantic Elements (${elements.length} total - ${typeSummary})`
+  );
+
+  return metadata.join("\n") + "\n\n" + text;
+}
+
+/**
+ * Creates a new chunk with context from the previous chunk
+ */
+function createNewChunkWithContext(previousChunk) {
+  // Find important elements for context overlap
+  const contextElements = getContextElements(
+    previousChunk.elements,
+    CONSTANTS.OVERLAP_TOKENS
+  );
+
+  // Create new chunk with context
+  return {
+    elements: [...contextElements],
+    text: "",
+    elementTypes: {},
+    headings: [...previousChunk.headings],
+    estimatedTokens: 0,
+    hasContextFromPrevious: true,
+  };
+}
+
+/**
+ * Gets important elements from the previous chunk to provide context
+ */
+function getContextElements(elements, maxTokens) {
+  if (elements.length === 0) return [];
+
+  const contextElements = [];
+  let tokenCount = 0;
+  const headings = elements.filter((el) => /^h[1-6]$/.test(el.tag));
+
+  for (const heading of headings) {
+    contextElements.push(heading);
+    tokenCount += Math.ceil(heading.text.length / 4);
+  }
+
+  const nonHeadings = elements
+    .filter((el) => !/^h[1-6]$/.test(el.tag))
+    .sort((a, b) => b.importance - a.importance);
+
+  // Include high importance elements first
+  for (const element of nonHeadings) {
+    const elementTokens = Math.ceil(element.text.length / 4);
+
+    if (tokenCount + elementTokens <= maxTokens) {
+      contextElements.push(element);
+      tokenCount += elementTokens;
+    }
+
+    if (tokenCount >= maxTokens) break;
+  }
+
+  return contextElements;
+}
+
+/**
+ * Finalizes a chunk with proper metadata and accurate token count
+ */
+async function finalizeChunk(chunk) {
+  const enhancedText = chunk.text;
 
   try {
-    let allPrioritizedItems = [];
-    let chunkOffset = 10000;
+    const tokenResponse = await chrome.runtime.sendMessage({
+      action: "countTokens",
+      text: enhancedText,
+      includeSystemPrompt: true,
+    });
 
-    for (let i = 0; i < processChunks.length; i++) {
-      outputElement.innerHTML = `<div style="padding:10px;text-align:center">
-          Processing chunk ${i + 1}/${processChunks.length}...
-          <div style="height:4px;background:#333;margin-top:8px;border-radius:2px">
-            <div style="height:100%;background:#4285f4;width:${Math.round(
-              (i / processChunks.length) * 100
-            )}%;border-radius:2px"></div>
-          </div>
-        </div>`;
+    const actualTokens = tokenResponse.success
+      ? tokenResponse.tokenCount - CONSTANTS.SYSTEM_PROMPT_TOKENS
+      : chunk.estimatedTokens;
 
-      const chunk = processChunks[i];
-      chunk.textNodes.forEach((node) => {
-        node.chunkIndex = i;
-        node.chunkText = chunk.text;
-      });
-      console.log("Chunk before processing:", chunk);
+    return {
+      ...chunk,
+      text: enhancedText,
+      estimatedTokens: chunk.estimatedTokens,
+      actualTokens: actualTokens,
+      chunkId: `chunk_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+    };
+  } catch (error) {
+    console.error("Error getting token count:", error);
+    return {
+      ...chunk,
+      text: enhancedText,
+      chunkId: `chunk_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+    };
+  }
+}
 
+/**
+ * Splits a large element into smaller chunks
+ */
+function splitLargeElement(element, maxTokens) {
+  const chunks = [];
+  const text = element.text;
+
+  if (element.isCodeBlock) {
+    const lines = text.split("\n");
+    let currentChunk = { text: "", index: 0 };
+    let chunkIndex = 0;
+
+    for (const line of lines) {
+      const lineTokens = Math.ceil(line.length / 4);
+      const currentChunkTokens = Math.ceil(currentChunk.text.length / 4);
+
+      if (currentChunkTokens + lineTokens > maxTokens && currentChunk.text) {
+        chunks.push({ ...currentChunk, index: chunkIndex++ });
+        currentChunk = { text: "", index: chunkIndex };
+      }
+
+      currentChunk.text += (currentChunk.text ? "\n" : "") + line;
+    }
+
+    if (currentChunk.text) {
+      chunks.push({ ...currentChunk, index: chunkIndex });
+    }
+  } else {
+    // Split normal text by paragraphs, then sentences
+    const paragraphs = text.split(/\n\n+/);
+    let currentChunk = { text: "", index: 0 };
+    let chunkIndex = 0;
+
+    for (const paragraph of paragraphs) {
+      const paraTokens = Math.ceil(paragraph.length / 4);
+
+      if (paraTokens > maxTokens) {
+        // This paragraph alone is too large, split by sentences
+        const sentences = paragraph.split(/(?<=[.!?])\s+/);
+
+        for (const sentence of sentences) {
+          const sentenceTokens = Math.ceil(sentence.length / 4);
+          const currentChunkTokens = Math.ceil(currentChunk.text.length / 4);
+
+          if (
+            currentChunkTokens + sentenceTokens > maxTokens &&
+            currentChunk.text
+          ) {
+            chunks.push({ ...currentChunk, index: chunkIndex++ });
+            currentChunk = { text: "", index: chunkIndex };
+          }
+
+          currentChunk.text += (currentChunk.text ? " " : "") + sentence;
+        }
+      } else {
+        const currentChunkTokens = Math.ceil(currentChunk.text.length / 4);
+
+        if (currentChunkTokens + paraTokens > maxTokens && currentChunk.text) {
+          chunks.push({ ...currentChunk, index: chunkIndex++ });
+          currentChunk = { text: "", index: chunkIndex };
+        }
+
+        currentChunk.text += (currentChunk.text ? "\n\n" : "") + paragraph;
+      }
+    }
+
+    if (currentChunk.text) {
+      chunks.push({ ...currentChunk, index: chunkIndex });
+    }
+  }
+
+  return chunks;
+}
+
+/**
+ * Processes chunks through the LLM and applies highlighting
+ */
+async function processChunks(chunks) {
+  const outputElement = shadowRoot.getElementById(CONSTANTS.outputElementID);
+  let allResults = [];
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    outputElement.innerHTML = `
+      <div style="padding:10px;text-align:center">
+        Processing chunk ${i + 1} of ${chunks.length}...
+        <div style="height:4px;background:#333;margin-top:8px;border-radius:2px">
+          <div style="height:100%;background:#4285f4;width:${Math.round(
+            (i / chunks.length) * 100
+          )}%;border-radius:2px"></div>
+        </div>
+      </div>
+    `;
+
+    // Build context for this chunk
+    let textToProcess = chunk.text;
+
+    // If not the first chunk, include a summary of results so far
+    if (i > 0 && allResults.length > 0) {
+      const contextSummary = createContextSummary(allResults);
+      textToProcess = `PREVIOUS ANALYSIS SUMMARY:\n${contextSummary}\n\nCURRENT TEXT TO ANALYZE:\n${chunk.text}`;
+    }
+
+    try {
+      console.log("Text to process:", textToProcess);
+      // Send to LLM for processing
       const response = await chrome.runtime.sendMessage({
         action: "callGemini",
-        text: chunk.text,
+        text: textToProcess,
         isChunk: true,
         chunkIndex: i,
         totalChunks: chunks.length,
-        idOffset: i * chunkOffset,
+        idOffset: i * 10000,
       });
 
       if (response.success) {
-        try {
-          console.log(`Raw LLM response for chunk ${i + 1}:`, response.data);
-          const cleanedResponse = cleanLLMResponse(response.data);
-          console.log(`Cleaned response for chunk ${i + 1}:`, cleanedResponse);
+        const chunkResults = JSON.parse(cleanLLMResponse(response.data));
+        console.log(`Chunk ${i + 1} results:`, chunkResults);
+        chunkResults.forEach((item) => {
+          item.sourceChunkIndex = i;
+          item.elements = findMatchingElements(item.text, chunk.elements);
+        });
 
-          if (!isCompleteJSON(cleanedResponse)) {
-            outputElement.innerHTML += `<div style="color:#ff9800;padding:5px;font-size:12px">
-            Incomplete JSON detected for chunk ${
-              i + 1
-            }. Requesting continuation...
-          </div>`;
-
-            const continuationResponse = await requestContinuation(
-              cleanedResponse,
-              chunk,
-              i,
-              chunks.length,
-              i * chunkOffset
-            );
-
-            if (continuationResponse.success) {
-              const continuationCleaned = cleanLLMResponse(
-                continuationResponse.data
-              );
-
-              try {
-                const initialItems = extractPartialJSON(cleanedResponse);
-                const continuationItems =
-                  extractPartialJSON(continuationCleaned);
-
-                const combinedItems = [...initialItems, ...continuationItems];
-                console.log(
-                  `Combined ${initialItems.length} initial items with ${continuationItems.length} continuation items`
-                );
-
-                allPrioritizedItems = allPrioritizedItems.concat(combinedItems);
-
-                outputElement.innerHTML += `<div style="color:#4CAF50;padding:5px;font-size:12px">
-                Successfully recovered ${
-                  combinedItems.length
-                } items for chunk ${i + 1}
-              </div>`;
-                continue;
-              } catch (mergeError) {
-                console.error("Error merging responses:", mergeError);
-              }
-            }
-          }
-
-          try {
-            const chunkResults = JSON.parse(cleanedResponse);
-            allPrioritizedItems = allPrioritizedItems.concat(chunkResults);
-          } catch (e) {
-            console.error("Error parsing chunk result:", e);
-            outputElement.innerHTML += `<div style="color:#ff6b6b;padding:5px;font-size:12px">
-        Warning: Failed to process chunk ${i + 1}. Trying alternative parsing...
-      </div>`;
-
-            try {
-              const extractedItems = extractPartialJSON(response.data);
-              if (extractedItems.length > 0) {
-                allPrioritizedItems =
-                  allPrioritizedItems.concat(extractedItems);
-                outputElement.innerHTML += `<div style="color:#ffbb33;padding:5px;font-size:12px">
-            Recovered ${extractedItems.length} items from chunk ${i + 1}
-          </div>`;
-              }
-            } catch (recoveryError) {
-              console.error("Recovery attempt failed:", recoveryError);
-            }
-          }
-        } catch (e) {
-          console.error("Error cleaning response:", e);
-          outputElement.innerHTML += `<div style="color:#ff6b6b;padding:5px;font-size:12px">
-      Failed to clean response for chunk ${i + 1}
-    </div>`;
-        }
+        allResults = allResults.concat(chunkResults);
       } else {
-        outputElement.innerHTML += `<div style="color:#ff6b6b;padding:5px;font-size:12px">
-    Error in chunk ${i + 1}: ${response.error}
-  </div>`;
+        console.error(`Error processing chunk ${i + 1}:`, response.error);
       }
+    } catch (error) {
+      console.error(`Error processing chunk ${i + 1}:`, error);
     }
+  }
 
-    window.lastPrioritizedText = allPrioritizedItems;
+  // Process is complete, apply highlighting
+  applyHighlighting(allResults);
 
-    allPrioritizedItems.forEach((item, index) => {
-      const chunkIndex = Math.floor(item.id / chunkOffset);
-      if (chunkIndex < processChunks.length) {
-        item.sourceChunkIndex = chunkIndex;
-        item.sourceChunkText = processChunks[chunkIndex].text;
-      }
+  // Update UI with summary
+  const priorityCounts = {
+    high: allResults.filter((i) => i.priority >= 4).length,
+    medium: allResults.filter((i) => i.priority === 3).length,
+    low: allResults.filter((i) => i.priority < 3).length,
+  };
+
+  outputElement.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div>Text Prioritization Complete</div>
+      <button style="background:transparent;border:none;color:#aaa;cursor:pointer;font-size:18px">×</button>
+    </div>
+    <div style="background:#252525;padding:12px;border-radius:6px;font-size:13px">
+      <p>Highlighted ${allResults.length} text segments across ${chunks.length} chunks.</p>
+      <div style="margin:8px 0;font-size:12px">
+        <div>High priority: ${priorityCounts.high}</div>
+        <div>Medium priority: ${priorityCounts.medium}</div>
+        <div>Low priority: ${priorityCounts.low}</div>
+      </div>
+      <div style="display:flex;gap:10px;margin:12px 0;flex-wrap:wrap">
+        <span style="background:green;color:white;padding:2px 8px;border-radius:4px">High priority</span>
+        <span style="background:yellow;color:black;padding:2px 8px;border-radius:4px">Supporting</span>
+        <span style="background:red;color:white;padding:2px 8px;border-radius:4px">Important standalone</span>
+      </div>
+      <button id="reset-highlights" style="margin-top:12px;padding:8px;width:100%;background:#404040;border:none;border-radius:4px;color:white;cursor:pointer">
+        Reset Highlights
+      </button>
+    </div>
+  `;
+
+  outputElement
+    .querySelector("button#reset-highlights")
+    .addEventListener("click", resetHighlights);
+
+  outputElement
+    .querySelector('button[style*="background:transparent"]')
+    .addEventListener("click", () => {
+      outputElement.style.display = "none";
     });
 
-    applyTextHighlighting(allPrioritizedItems, allTextNodes);
-
-    outputElement.innerHTML = `
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <div>Text Prioritization Complete ${
-          CONSTANTS.DEBUG_MAX_CHUNKS ? "(Debug Mode)" : ""
-        }</div>
-        <button style="background:transparent;border:none;color:#aaa;cursor:pointer;font-size:18px">×</button>
-      </div>
-      <div style="background:#252525;padding:12px;border-radius:6px;font-size:13px">
-        <p>Highlighted ${allPrioritizedItems.length} text segments across ${
-      processChunks.length
-    } chunks.
-        ${
-          CONSTANTS.DEBUG_MAX_CHUNKS
-            ? `<br><span style="color:#ff9800">Debug: Limited to ${CONSTANTS.DEBUG_MAX_CHUNKS} of ${chunks.length} total chunks</span>`
-            : ""
-        }
-        </p>
-        <div style="display:flex;gap:10px;margin-bottom:8px;flex-wrap:wrap">
-          <span style="background:green;color:white;padding:2px 8px;border-radius:4px">High priority</span>
-          <span style="background:yellow;color:black;padding:2px 8px;border-radius:4px">Supporting</span>
-          <span style="background:red;color:white;padding:2px 8px;border-radius:4px">Important standalone</span>
-        </div>
-        <button id="reset-highlights" style="margin-top:12px;padding:8px;width:100%;background:#404040;border:none;border-radius:4px;color:white;cursor:pointer">
-          Reset Highlights
-        </button>
-      </div>
-    `;
-
-    outputElement
-      .querySelector("button#reset-highlights")
-      .addEventListener("click", resetHighlights);
-
-    outputElement
-      .querySelector('button[style*="background:transparent"]')
-      .addEventListener("click", () => {
-        outputElement.style.display = "none";
-      });
-  } catch (error) {
-    outputElement.innerHTML = `<div style="color:#ff6b6b;padding:10px">Error: ${error.message}</div>`;
-  }
+  window.lastPrioritizedText = allResults;
 }
 
 /**
- * Extracts valid or partial JSON objects from a string.
+ * Creates a summary of previous analysis for context
  */
-function extractPartialJSON(text) {
-  const items = [];
+function createContextSummary(results) {
+  if (results.length === 0) return "";
+  const topItems = results.sort((a, b) => b.priority - a.priority).slice(0, 3);
 
-  try {
-    try {
-      return JSON.parse(text);
-    } catch (e) {}
-
-    const regex = /{[^{]*"text"\s*:\s*"[^"]+(?:"[^}]*})/g;
-    let match;
-    let idCounter = Date.now();
-
-    while ((match = regex.exec(text)) !== null) {
-      try {
-        let objectText = match[0];
-        if (!objectText.endsWith("}")) {
-          objectText += "}";
-        }
-
-        objectText = objectText.replace(/'/g, '"');
-
-        let item;
-        try {
-          item = JSON.parse(objectText);
-        } catch (e) {
-          const textMatch = objectText.match(/"text"\s*:\s*"([^"]+)"/);
-          const text = textMatch ? textMatch[1] : "Extracted text";
-
-          item = {
-            text: text,
-            priority: 3,
-            color: "yellow",
-            summary: "Partially extracted item",
-            id: idCounter++,
-            supporting: null,
-          };
-        }
-
-        item.text = item.text || "Unknown text";
-        item.priority = item.priority || 3;
-        item.color = item.color || "yellow";
-        item.summary = item.summary || "Extracted text";
-        item.id = item.id || idCounter++;
-        item.supporting = item.supporting || null;
-
-        items.push(item);
-      } catch (e) {
-        console.error("Failed to extract item:", e);
-      }
-    }
-  } catch (e) {
-    console.error("Error in extractPartialJSON:", e);
-  }
-
-  return items;
+  return (
+    `I've analyzed ${results.length} elements so far. Key points from previous chunks:\n` +
+    topItems
+      .map((item) => `- ${item.summary} (priority: ${item.priority})`)
+      .join("\n")
+  );
 }
 
-// Highlights text nodes based on prioritized items
-function applyTextHighlighting(prioritizedText, textNodes) {
-  const priorityMap = new Map();
-  const modifiedNodes = new Map();
-  const chunkMap = new Map();
+/**
+ * Finds elements that match the given text
+ */
+function findMatchingElements(text, elements) {
+  // First try exact matches
+  let matches = elements.filter((element) => element.text === text);
+  if (matches.length === 0) {
+    const normalizedText = text.replace(/\s+/g, " ").trim();
 
-  textNodes.forEach((node) => {
-    const chunkText = node.text;
-    if (!chunkMap.has(chunkText)) {
-      chunkMap.set(chunkText, []);
+    matches = elements.filter((element) => {
+      const normalizedElement = element.text.replace(/\s+/g, " ").trim();
+      return (
+        normalizedElement.includes(normalizedText) ||
+        normalizedText.includes(normalizedElement)
+      );
+    });
+  }
+
+  // If still no matches, try word overlap
+  if (matches.length === 0) {
+    const textWords = new Set(
+      text
+        .toLowerCase()
+        .split(/\W+/)
+        .filter((w) => w.length > 3)
+    );
+
+    const candidates = elements.map((element) => {
+      const elementWords = new Set(
+        element.text
+          .toLowerCase()
+          .split(/\W+/)
+          .filter((w) => w.length > 3)
+      );
+      const overlap = [...textWords].filter((word) =>
+        elementWords.has(word)
+      ).length;
+      const overlapScore =
+        overlap / Math.max(textWords.size, elementWords.size);
+      return { element, overlapScore };
+    });
+
+    candidates.sort((a, b) => b.overlapScore - a.overlapScore);
+
+    if (candidates.length > 0 && candidates[0].overlapScore > 0.5) {
+      matches = candidates.slice(0, 1).map((c) => c.element);
     }
-    chunkMap.get(chunkText).push(node);
-  });
+  }
 
-  prioritizedText.forEach((item) => {
-    if (!item.text) return;
+  return matches.map((match) => ({
+    ...match,
+    node: match.element,
+  }));
+}
 
-    let highlightColor =
+/**
+ * Applies highlighting to the page based on LLM results
+ */
+function applyHighlighting(results) {
+  const highlightedElements = new Map();
+
+  results.forEach((item) => {
+    if (!item.elements || item.elements.length === 0) return;
+
+    // Determine highlight color
+    const highlightColor =
       item.color === "green"
         ? "#4CAF50"
         : item.color === "yellow"
@@ -464,247 +856,248 @@ function applyTextHighlighting(prioritizedText, textNodes) {
         ? "#F44336"
         : item.color;
 
-    let matches = textNodes.filter((node) => node.text.includes(item.text));
+    item.elements.forEach((element) => {
+      if (highlightedElements.has(element.node)) return;
 
-    if (matches.length === 0) {
-      const normalizedItemText = item.text
-        .replace(/\\n/g, "\n")
-        .replace(/\s+/g, " ")
-        .trim();
-
-      const matchCandidates = [];
-      textNodes.forEach((node) => {
-        const normalizedNodeText = node.text.replace(/\s+/g, " ").trim();
-
-        let score = 0;
-        const words = normalizedItemText.split(" ");
-        words.forEach((word) => {
-          if (word.length > 3 && normalizedNodeText.includes(word)) {
-            score++;
-          }
-        });
-
-        if (
-          score > words.length * 0.7 ||
-          normalizedNodeText.includes(normalizedItemText) ||
-          normalizedItemText.includes(normalizedNodeText)
-        ) {
-          matchCandidates.push({ node, score });
-        }
-      });
-
-      matchCandidates.sort((a, b) => b.score - a.score);
-      matches = matchCandidates.slice(0, 3).map((m) => m.node);
-    }
-
-    matches.forEach((match) => {
-      if (modifiedNodes.has(match.node)) return;
-
-      if (match.isCodeBlock) {
-        highlightCodeBlock(match, item, highlightColor, modifiedNodes);
+      if (element.isCodeBlock) {
+        highlightCodeBlock(element, item, highlightColor);
       } else {
-        highlightTextNode(match, item, highlightColor, modifiedNodes);
+        highlightTextNode(element, item, highlightColor);
       }
+
+      highlightedElements.set(element.node, true);
     });
   });
 }
 
-function highlightCodeBlock(match, item, color, modifiedNodes) {
-  const codeBlock = match.node;
-  const parent = codeBlock.parentElement;
+/**
+ * Highlights a code block
+ */
+function highlightCodeBlock(element, item, color) {
+  const node = element.element;
+  if (!node) return;
+
+  const parent = node.parentElement;
   if (!parent) return;
 
   const wrapper = document.createElement("div");
-  wrapper.style.position = "relative";
-  wrapper.style.display = "inline-block";
+  wrapper.style.cssText = `
+    position: relative;
+    display: block;
+    margin: 5px 0;
+    border: 2px solid ${color};
+    border-radius: 5px;
+    overflow: hidden;
+  `;
+  wrapper.className = "priority-highlight";
+  wrapper.dataset.priorityId = item.id;
 
   const overlay = document.createElement("div");
-  overlay.className = "priority-highlight";
   overlay.dataset.priorityId = item.id;
-  overlay.style.cssText = `position:absolute;top:0;left:0;right:0;bottom:0;background-color:${color};opacity:0.2;pointer-events:none;z-index:1`;
+  overlay.style.cssText = `
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: ${color};
+    opacity: 0.4;
+    pointer-events: none;
+    z-index: 1;
+  `;
 
-  const infoButton = document.createElement("span");
-  infoButton.innerHTML = "*";
-  infoButton.style.cssText = `position:absolute;top:0;right:0;background:#555;color:white;border-radius:50%;width:16px;height:16px;font-size:12px;text-align:center;line-height:16px;cursor:pointer;opacity:0;transition:opacity 0.2s;z-index:2`;
+  // const infoButton = document.createElement("span");
+  // infoButton.innerHTML = "ⓘ";
+  // infoButton.style.cssText = `
+  //   position: absolute;
+  //   top: 5px;
+  //   right: 5px;
+  //   background: #555;
+  //   color: white;
+  //   border-radius: 50%;
+  //   width: 16px;
+  //   height: 16px;
+  //   font-size: 12px;
+  //   text-align: center;
+  //   line-height: 16px;
+  //   cursor: pointer;
+  //   opacity: 1;
+  //   transition: opacity 0.2s;
+  //   z-index: 2;
+  //   box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  // `;
+
+  const contentWrapper = document.createElement("div");
+  contentWrapper.style.cssText = `
+    position: relative;
+    z-index: 1;
+  `;
+  contentWrapper.appendChild(node.cloneNode(true));
 
   wrapper.addEventListener("mouseenter", () => {
-    infoButton.style.opacity = "1";
-    overlay.style.opacity = "0.4";
+    // infoButton.style.opacity = "1";
+    overlay.style.opacity = "0.6";
   });
 
   wrapper.addEventListener("mouseleave", () => {
-    infoButton.style.opacity = "0";
-    overlay.style.opacity = "0.2";
+    // infoButton.style.opacity = "0.7";
+    overlay.style.opacity = "0.4";
   });
 
-  infoButton.addEventListener("click", (e) => {
-    e.stopPropagation();
-    showSummary(item, wrapper);
-  });
-
-  wrapper.appendChild(codeBlock.cloneNode(true));
+  wrapper.appendChild(contentWrapper);
   wrapper.appendChild(overlay);
-  wrapper.appendChild(infoButton);
+  // wrapper.appendChild(infoButton);
+  addInfoButton(item, wrapper);
 
-  parent.replaceChild(wrapper, codeBlock);
-  modifiedNodes.set(match.node, wrapper);
+  parent.replaceChild(wrapper, node);
 }
+
 /**
- * Highlights a text node with a colored span and adds an info button for summary.
+ * Highlights a text node
  */
-function highlightTextNode(match, item, color, modifiedNodes) {
+function highlightTextNode(element, item, color) {
+  const node = element.element;
+  if (!node) return;
+
+  const parent = node.parentElement;
+  if (!parent) return;
+
   const span = document.createElement("span");
-  span.style.backgroundColor = color;
-  span.style.opacity = "0.4";
-  span.style.position = "relative";
+  span.style.cssText = `
+    background-color: ${color};
+    opacity: 0.7;
+    position: relative;
+    padding: 2px 4px;
+    border-radius: 3px;
+    border: 1px solid ${color.replace(/[^,]+(?=\))/, "1")};
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    display: inline-block;
+  `;
   span.className = "priority-highlight";
   span.dataset.priorityId = item.id;
 
-  const parent = match.parentElement;
-  if (!parent) return;
-
+  // Clone node content into the span
   const wrapper = document.createElement("span");
-  wrapper.appendChild(match.node.cloneNode(true));
+  wrapper.appendChild(node.cloneNode(true));
   span.innerHTML = wrapper.innerHTML;
 
-  const infoButton = document.createElement("span");
-  infoButton.innerHTML = "*";
-  infoButton.style.cssText = `position:absolute;top:-8px;right:-8px;background:#555;color:white;border-radius:50%;width:16px;height:16px;font-size:12px;text-align:center;line-height:16px;cursor:pointer;opacity:0;transition:opacity 0.2s`;
-  span.appendChild(infoButton);
+  // Add info button
+  // const infoButton = document.createElement("span");
+  // infoButton.innerHTML = "ⓘ";
+  // infoButton.style.cssText = `
+  //   position: absolute;
+  //   top: -8px;
+  //   right: -8px;
+  //   background: #555;
+  //   color: white;
+  //   border-radius: 50%;
+  //   width: 16px;
+  //   height: 16px;
+  //   font-size: 12px;
+  //   text-align: center;
+  //   line-height: 16px;
+  //   cursor: pointer;
+  //   opacity: 1;
+  //   transition: opacity 0.2s;
+  //   z-index: 3;
+  // `;
+
+  // span.appendChild(infoButton);
 
   span.addEventListener("mouseenter", () => {
-    infoButton.style.opacity = "1";
+    // infoButton.style.opacity = "1";
+    span.style.opacity = "0.9";
   });
 
   span.addEventListener("mouseleave", () => {
-    infoButton.style.opacity = "0";
+    // infoButton.style.opacity = "0.7";
+    span.style.opacity = "0.7";
   });
 
-  infoButton.addEventListener("click", (e) => {
+  // infoButton.addEventListener("click", (e) => {
+  //   e.stopPropagation();
+  //   showSummary(item, span);
+  // });
+
+  addInfoButton(item, span);
+  parent.replaceChild(span, node);
+}
+
+function addInfoButton(item, wrapper) {
+  const info = document.createElement("button");
+  info.type = "button";
+  info.className = "priority-info";
+  info.setAttribute("aria-label", "Show summary");
+  info.dataset.priorityId = item.id;
+
+  info.innerHTML = "ⓘ";
+  info.style.cssText = `
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 10002;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border-radius: 50%;
+    border: none;
+    background: rgba(0,0,0,0.65);
+    color: #fff;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    pointer-events: auto;
+    transition: transform 120ms ease, background 120ms ease;
+  `;
+
+  info.addEventListener("pointerdown", (e) => {
     e.stopPropagation();
-    showSummary(item, span);
+    e.preventDefault();
+    showSummary(item, wrapper);
   });
 
-  parent.replaceChild(span, match.node);
-  modifiedNodes.set(match.node, span);
+  wrapper.appendChild(info);
 }
 
 /**
- * Cleans and extracts valid JSON from LLM response.
- */
-function cleanLLMResponse(response) {
-  try {
-    try {
-      JSON.parse(response);
-      return response;
-    } catch (e) {}
-
-    let cleaned = response;
-    if (cleaned.includes("```json")) {
-      cleaned = cleaned.replace(/```json\s*/g, "");
-      cleaned = cleaned.replace(/```\s*$/g, "");
-    }
-
-    const startIndex = cleaned.indexOf("[");
-    const endIndex = cleaned.lastIndexOf("]") + 1;
-
-    if (startIndex >= 0 && endIndex > startIndex) {
-      cleaned = cleaned.substring(startIndex, endIndex);
-    }
-
-    JSON.parse(cleaned);
-    return cleaned;
-  } catch (e) {
-    try {
-      const items = [];
-      const regex = /"text"\s*:\s*"([^"]+)"/g;
-      let match;
-      let idCounter = 0;
-
-      while ((match = regex.exec(response)) !== null) {
-        try {
-          const objectText = match[0].replace(/'/g, '"');
-          const item = JSON.parse(objectText);
-          items.push(item);
-        } catch (parseError) {
-          const objectText = match[0];
-
-          const textMatch = objectText.match(/"text"\s*:\s*"([^"]+)"/);
-          const text = textMatch ? textMatch[1] : "Unknown text";
-
-          const priorityMatch = objectText.match(/"priority"\s*:\s*(\d+)/);
-          const priority = priorityMatch ? parseInt(priorityMatch[1]) : 3;
-
-          const colorMatch = objectText.match(/"color"\s*:\s*"([^"]+)"/);
-          const color = colorMatch ? colorMatch[1] : "yellow";
-
-          const summaryMatch = objectText.match(/"summary"\s*:\s*"([^"]+)"/);
-          const summary = summaryMatch ? summaryMatch[1] : "Extracted item";
-
-          const idMatch = objectText.match(/"id"\s*:\s*(\d+)/);
-          idCounter = idMatch ? parseInt(idMatch[1]) : idCounter++;
-
-          const supportingMatch = objectText.match(/"supporting"\s*:\s*(\w+)/);
-          const supporting = supportingMatch
-            ? supportingMatch[1] === "null"
-              ? null
-              : parseInt(supportingMatch[1])
-            : null;
-
-          items.push({
-            text,
-            priority,
-            color,
-            summary,
-            id: idCounter,
-            supporting,
-          });
-        }
-      }
-      if (items.length > 0) {
-        return JSON.stringify(items);
-      }
-    } catch (finalError) {
-      console.error("Final JSON parsing attempt failed:", finalError);
-    }
-    return "[]";
-  }
-}
-
-/**
- * Sends text to Gemini via Chrome extension messaging.
- */
-async function sendToGemini(text) {
-  try {
-    const response = await chrome.runtime.sendMessage({
-      action: "callGemini",
-      text: text,
-    });
-
-    if (response.success) {
-      console.log("LLM Response received:", response.data);
-      return response.data;
-    } else {
-      throw new Error(response.error);
-    }
-  } catch (error) {
-    throw error;
-  }
-}
-
-/**
- * Shows a summary tooltip for a prioritized item.
+ * Shows a summary tooltip
  */
 function showSummary(item, element) {
-  const existingTooltip = document.querySelector(".priority-tooltip");
-  if (existingTooltip) {
-    existingTooltip.remove();
+  const existingDoc = document.querySelector(".priority-tooltip");
+  if (existingDoc) existingDoc.remove();
+  if (typeof shadowRoot !== "undefined" && shadowRoot) {
+    const existingShadow = shadowRoot.querySelector(".priority-tooltip");
+    if (existingShadow) existingShadow.remove();
+  }
+
+  let priorityId = null;
+  if (element.dataset && element.dataset.priorityId) {
+    priorityId = element.dataset.priorityId;
+  } else if (element.querySelector) {
+    const elementWithId = element.querySelector("[data-priority-id]");
+    if (elementWithId) priorityId = elementWithId.dataset.priorityId;
+  }
+  if (!priorityId && item) priorityId = item.id;
+
+  let displayItem = item;
+  if (
+    priorityId &&
+    window.lastPrioritizedText &&
+    window.lastPrioritizedText.length > 0
+  ) {
+    const foundItem = window.lastPrioritizedText.find(
+      (t) => Number(t.id) === Number(priorityId)
+    );
+    if (foundItem) displayItem = foundItem;
   }
 
   const tooltip = document.createElement("div");
   tooltip.className = "priority-tooltip";
   tooltip.style.cssText = `
-    position: absolute;
+    position: fixed;
     z-index: 10001;
     background: #333;
     color: white;
@@ -712,14 +1105,18 @@ function showSummary(item, element) {
     border-radius: 4px;
     max-width: 300px;
     box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-    top: ${element.offsetTop + element.offsetHeight}px;
-    left: ${element.offsetLeft}px;
+    visibility: hidden;
+    pointer-events: auto;
   `;
 
   let supportingText = "";
-  if (item.supporting && window.lastPrioritizedText) {
+  if (
+    displayItem.supporting &&
+    displayItem.supporting !== -1 &&
+    window.lastPrioritizedText
+  ) {
     const supporting = window.lastPrioritizedText.find(
-      (t) => t.id === item.supporting
+      (t) => t.id === displayItem.supporting
     );
     if (supporting) {
       supportingText = `<p><strong>Supporting:</strong> ${supporting.text}</p>`;
@@ -727,105 +1124,75 @@ function showSummary(item, element) {
   }
 
   tooltip.innerHTML = `
-    <h4 style="margin-top:0">Priority: ${item.priority}/5</h4>
-    <p>${item.summary || "No summary available"}</p>
+    <h4 style="margin-top:0">Priority: ${displayItem.priority}/5</h4>
+    <p>${displayItem.summary || "No summary available"}</p>
     ${supportingText}
     <div style="text-align:right"><small>Click anywhere to dismiss</small></div>
   `;
 
-  document.body.appendChild(tooltip);
+  const insertRoot =
+    typeof shadowRoot !== "undefined" && shadowRoot
+      ? shadowRoot
+      : document.body;
+  insertRoot.appendChild(tooltip);
+
+  const elRect = element.getBoundingClientRect();
+  const ttRect = tooltip.getBoundingClientRect();
+
+  const MARGIN = 8;
+  let top = elRect.bottom + MARGIN;
+  if (top + ttRect.height > window.innerHeight - MARGIN) {
+    top = elRect.top - ttRect.height - MARGIN;
+  }
+  if (top < MARGIN) top = MARGIN;
+
+  let left = elRect.left;
+  if (left + ttRect.width > window.innerWidth - MARGIN) {
+    left = Math.max(MARGIN, window.innerWidth - ttRect.width - MARGIN);
+  }
+  if (left < MARGIN) left = MARGIN;
+
+  tooltip.style.top = `${Math.round(top)}px`;
+  tooltip.style.left = `${Math.round(left)}px`;
+  tooltip.style.visibility = "visible";
+
+  const closeTooltip = (e) => {
+    const path = e.composedPath ? e.composedPath() : e.path || [];
+    for (const node of path) {
+      try {
+        if (
+          node &&
+          node.classList &&
+          node.classList.contains("priority-tooltip")
+        ) {
+          return;
+        }
+        if (node && node.dataset && node.dataset.priorityId) {
+          return;
+        }
+      } catch (err) {}
+    }
+
+    tooltip.remove();
+    document.removeEventListener("click", closeTooltip, true);
+    if (typeof shadowRoot !== "undefined" && shadowRoot) {
+      try {
+        shadowRoot.removeEventListener("click", closeTooltip, true);
+      } catch (err) {}
+    }
+  };
 
   setTimeout(() => {
-    const closeTooltip = () => {
-      tooltip.remove();
-      document.removeEventListener("click", closeTooltip);
-    };
-    document.addEventListener("click", closeTooltip);
-  }, 100);
-}
-
-/**
- * Checks if a string is a complete JSON structure.
- */
-function isCompleteJSON(jsonString) {
-  try {
-    JSON.parse(jsonString);
-    return true;
-  } catch (e) {
-    const openBrackets = (jsonString.match(/\{/g) || []).length;
-    const closeBrackets = (jsonString.match(/\}/g) || []).length;
-    const openSquare = (jsonString.match(/\[/g) || []).length;
-    const closeSquare = (jsonString.match(/\]/g) || []).length;
-
-    return openBrackets === closeBrackets && openSquare === closeSquare;
-  }
-}
-
-/**
- * Requests a continuation from the LLM for an incomplete JSON response.
- */
-async function requestContinuation(
-  incompleteJson,
-  chunk,
-  chunkIndex,
-  totalChunks,
-  idOffset
-) {
-  let lastCompleteItem = null;
-  try {
-    const jsonText = incompleteJson.trim();
-    const lastCompleteObjectEnd = jsonText.lastIndexOf("},");
-
-    if (lastCompleteObjectEnd > 0) {
-      const partialArrayJson =
-        jsonText.substring(0, lastCompleteObjectEnd + 1) + "]";
-      const partialArray = JSON.parse(partialArrayJson);
-
-      if (partialArray.length > 0) {
-        lastCompleteItem = partialArray[partialArray.length - 1];
-      }
+    document.addEventListener("click", closeTooltip, true);
+    if (typeof shadowRoot !== "undefined" && shadowRoot) {
+      shadowRoot.addEventListener("click", closeTooltip, true);
     }
-  } catch (e) {
-    console.error("Error extracting last complete item:", e);
-  }
-
-  const continuationText = `You previously analyzed a chunk of text but your response was truncated. Here is the incomplete JSON response you provided:
-  
-${incompleteJson.substring(0, 500)}...
-
-Please continue your analysis from where you left off. Make sure to:
-1. Start with a valid JSON array opening bracket [
-2. Include any items that may have been cut off
-3. Continue analyzing the rest of the chunk
-4. End with a valid JSON array closing bracket ]
-
-${
-  lastCompleteItem
-    ? `The last complete item you analyzed had ID: ${
-        lastCompleteItem.id
-      } and text: "${lastCompleteItem.text.substring(0, 50)}..."`
-    : ""
+  }, 50);
 }
 
-IMPORTANT: Use IDs starting where you left off. Ensure proper JSON formatting.`;
-
-  const response = await chrome.runtime.sendMessage({
-    action: "callGemini",
-    text:
-      continuationText +
-      "\n\nHere's the original text to continue analyzing:\n\n" +
-      chunk.text,
-    isChunk: true,
-    chunkIndex: chunkIndex,
-    totalChunks: totalChunks,
-    idOffset: idOffset,
-    isContinuation: true,
-  });
-
-  return response;
-}
-
-// Resets all highlights applied to the page
+/**
+ * Resets all highlights on the page
+ */
 function resetHighlights() {
   const highlights = document.querySelectorAll(".priority-highlight");
   console.log(`Found ${highlights.length} highlights to reset`);
@@ -833,15 +1200,16 @@ function resetHighlights() {
   highlights.forEach((highlight) => {
     try {
       const parent = highlight.parentElement;
-      if (parent && highlight.style.position === "absolute") {
-        const codeBlock = parent.querySelector("code");
-        if (codeBlock && parent.parentElement) {
-          parent.parentElement.replaceChild(codeBlock, parent);
+      if (parent) {
+        const codeBlock =
+          highlight.querySelector("pre") || highlight.querySelector("code");
+        if (codeBlock && parent) {
+          parent.replaceChild(codeBlock, highlight);
+        } else {
+          const textContent = highlight.textContent.replace("ⓘ", "");
+          const textNode = document.createTextNode(textContent);
+          parent.replaceChild(textNode, highlight);
         }
-      } else if (parent) {
-        const textContent = highlight.textContent.replace("*", "");
-        const textNode = document.createTextNode(textContent);
-        parent.replaceChild(textNode, highlight);
       }
     } catch (e) {
       console.error("Error resetting highlight:", e);
@@ -866,11 +1234,41 @@ function resetHighlights() {
   }
 }
 
-// Initializes the UI when the DOM is ready
+/**
+ * Cleans the LLM response to ensure valid JSON
+ */
+function cleanLLMResponse(response) {
+  try {
+    let c = JSON.parse(response);
+
+    return c["highlights"] ? JSON.stringify(c["highlights"]) : "[]";
+  } catch (e) {
+    try {
+      let cleaned = response;
+      if (cleaned.includes("```json")) {
+        cleaned = cleaned.replace(/```json\s*/g, "");
+        cleaned = cleaned.replace(/```\s*$/g, "");
+      }
+      const startIndex = cleaned.indexOf("[");
+      const endIndex = cleaned.lastIndexOf("]") + 1;
+      if (startIndex >= 0 && endIndex > startIndex) {
+        cleaned = cleaned.substring(startIndex, endIndex);
+      }
+
+      JSON.parse(cleaned);
+      return cleaned;
+    } catch (cleaningError) {
+      console.error("Unable to parse LLM response as JSON:", cleaningError);
+      console.log("Raw response:", response);
+      return "[]";
+    }
+  }
+}
+
+// Initialize UI
 document.addEventListener("DOMContentLoaded", createUI);
 
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", createUI);
-} else {
+// If document already loaded, create UI immediately
+if (document.readyState !== "loading") {
   createUI();
 }
